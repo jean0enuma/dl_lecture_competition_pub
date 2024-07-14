@@ -10,7 +10,11 @@ import torch
 import torch.nn as nn
 import torchvision
 from torchvision import transforms
+from tqdm import tqdm
 
+#学習済みモデル
+from torchvision.models import resnet18,resnet50
+import math
 
 def set_seed(seed):
     random.seed(seed)
@@ -58,6 +62,7 @@ def process_text(text):
     # 連続するスペースを1つに変換
     text = re.sub(r'\s+', ' ', text).strip()
 
+
     return text
 
 
@@ -93,6 +98,17 @@ class VQADataset(torch.utils.data.Dataset):
                     if word not in self.answer2idx:
                         self.answer2idx[word] = len(self.answer2idx)
             self.idx2answer = {v: k for k, v in self.answer2idx.items()}  # 逆変換用の辞書(answer)
+
+    def max_len(self):
+        """
+        質問文の最大の長さを返す．
+        """
+        max_len = 0
+        for question in self.df["question"]:
+            question = process_text(question)
+            words = question.split(" ")
+            max_len = max(max_len, len(words))
+        return max_len
 
     def update_dict(self, dataset):
         """
@@ -133,6 +149,7 @@ class VQADataset(torch.utils.data.Dataset):
         question = np.zeros(len(self.idx2question) + 1)  # 未知語用の要素を追加
         question_words = self.df["question"][idx].split(" ")
         for word in question_words:
+            word = process_text(word)
             try:
                 question[self.question2idx[word]] = 1  # one-hot表現に変換
             except KeyError:
@@ -285,18 +302,50 @@ def ResNet18():
 
 def ResNet50():
     return ResNet(BottleneckBlock, [3, 4, 6, 3])
+class PositionalEncoding(nn.Module):
 
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Tensor, shape [seq_len, batch_size, embedding_dim]
+        """
+        x = x + self.pe[:x.size(0)]
+        return self.dropout(x)
+class TransformerEncoder(nn.Module):
+    def __init__(self, d_model: int, nhead: int, num_encoder_layers: int, dim_feedforward: int, dropout: float):
+        super().__init__()
+        layers= nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout,batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(layers, num_encoder_layers)
+    def forward(self, src, mask=None):
+        output = self.transformer_encoder(src, mask)
+        return output
 
 class VQAModel(nn.Module):
     def __init__(self, vocab_size: int, n_answer: int):
         super().__init__()
-        self.resnet = ResNet18()
-        self.text_encoder = nn.Linear(vocab_size, 512)
+        self.resnet = resnet50(weights='DEFAULT')
+        self.resnet.fc = nn.Identity()
+        self.text_encoder = nn.Sequential(
+            nn.Linear(vocab_size, 512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, 1024),
+        )
 
         self.fc = nn.Sequential(
-            nn.Linear(1024, 512),
+            nn.Linear(512*6, 1024),
             nn.ReLU(inplace=True),
-            nn.Linear(512, n_answer)
+            nn.Linear(1024, n_answer)
         )
 
     def forward(self, image, question):
@@ -310,24 +359,28 @@ class VQAModel(nn.Module):
 
 
 # 4. 学習の実装
-def train(model, dataloader, optimizer, criterion, device):
+def train(model, dataloader, optimizer, criterion, device,batch_size=64):
     model.train()
 
     total_loss = 0
     total_acc = 0
     simple_acc = 0
-
+    scaler = torch.cuda.amp.GradScaler(4096)
     start = time.time()
-    for image, question, answers, mode_answer in dataloader:
-        image, question, answer, mode_answer = \
-            image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
-
-        pred = model(image, question)
-        loss = criterion(pred, mode_answer.squeeze())
+    for i,(image, question, answers, mode_answer) in tqdm(enumerate(dataloader), total=len(dataloader.dataset)//batch_size):
+        image,question,answers,mode_answer=image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
+        with torch.cuda.amp.autocast():
+            pred = model(image, question)
+            loss = criterion(pred, mode_answer.squeeze())
 
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()
+        # クリップ時に正しくできるように一度スケールを戻す
+        scaler.unscale_(optimizer)
+        # 大きすぎる勾配をクリップ
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
 
         total_loss += loss.item()
         total_acc += VQA_criterion(pred.argmax(1), answers)  # VQA accuracy
@@ -344,12 +397,13 @@ def eval(model, dataloader, optimizer, criterion, device):
     simple_acc = 0
 
     start = time.time()
+
     for image, question, answers, mode_answer in dataloader:
         image, question, answer, mode_answer = \
             image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
-
-        pred = model(image, question)
-        loss = criterion(pred, mode_answer.squeeze())
+        with torch.cuda.amp.autocast():
+            pred = model(image, question)
+            loss = criterion(pred, mode_answer.squeeze())
 
         total_loss += loss.item()
         total_acc += VQA_criterion(pred.argmax(1), answers)  # VQA accuracy
@@ -362,20 +416,35 @@ def main():
     # deviceの設定
     set_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"device: {device}")
 
     # dataloader / model
     transform = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.RandomCrop((224, 224)),
+        transforms.RandomRotation(10),
+        transforms.ToTensor()
+    ])
+    test_transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor()
     ])
     train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
-    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
+    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=test_transform, answer=False)
     test_dataset.update_dict(train_dataset)
+    print(f"train dataset: {len(train_dataset)}")
+    print(f"test dataset: {len(test_dataset)}")
+    print(f"question vocab size: {len(train_dataset.question2idx)}")
+    print(f"answer vocab size: {len(train_dataset.answer2idx)}")
+    print(f"question max length: {train_dataset.max_len()}")
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
+    batch_size = 128
 
-    model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
+
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True,pin_memory=True,num_workers=8,drop_last=True)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False,pin_memory=True,num_workers=8)
+
+    model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).float().to(device)
 
     # optimizer / criterion
     num_epoch = 20
@@ -383,14 +452,21 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
 
     # train model
+    print("start training...")
     for epoch in range(num_epoch):
-        train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device)
+        train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device,batch_size)
         print(f"【{epoch + 1}/{num_epoch}】\n"
               f"train time: {train_time:.2f} [s]\n"
               f"train loss: {train_loss:.4f}\n"
               f"train acc: {train_acc:.4f}\n"
               f"train simple acc: {train_simple_acc:.4f}")
 
+
+        torch.save({
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "epoch": epoch
+        }, f"./checkpoint/checkpoint.cpt")
     # 提出用ファイルの作成
     model.eval()
     submission = []
@@ -406,4 +482,5 @@ def main():
     np.save("submission.npy", submission)
 
 if __name__ == "__main__":
+    torch.multiprocessing.set_start_method('spawn', True)
     main()
