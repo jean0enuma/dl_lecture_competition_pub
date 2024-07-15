@@ -1,7 +1,6 @@
 # DL基礎講座2024　最終課題「Visual Question Answering（VQA）」
 
-<<<<<<< HEAD
-=======
+
 ## 概要
 ### 最終課題内容：3つのタスクから1つ選び，高い性能となるモデルを開発してください（コンペティション形式）
 3つのタスクはそれぞれ以下の通りです．必ず**1つ**を選んで提出してください．
@@ -20,7 +19,6 @@
   - 入力: イベントデータ（各時刻，どのピクセルで"log intensity"に変化があったかを記録）．
   - 出力: Optical Flow（連続フレーム間で，各ピクセルの動きをベクトルで表したもの）．
   - 評価指標: Average Endpoint Error（推定したOptical Flowと正解のOptical Flowのユークリッド距離）．
->>>>>>> b22a9bb1792e8dde72521ce42585cf7efff985bb
 
 ## 環境構築
 ### Conda
@@ -31,7 +29,7 @@ pip install -r requirements.txt
 ### Docker
 - Dockerイメージのcudaバージョンについては，ご自身が利用するGPUに合わせて変更してください．
 ```bash
-<<<<<<< HEAD
+
 docker build -t <イメージ名> .
 docker run -it -v $PWD:/workspace -w /workspace <イメージ名> bash
 =======
