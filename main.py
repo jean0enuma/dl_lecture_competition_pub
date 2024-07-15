@@ -260,10 +260,13 @@ class TransformerEncoder(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(layers, num_encoder_layers)
         self.cls = nn.Parameter(torch.randn(1, 1, d_model))
 
-    def forward(self, src, src_length):
+    def forward(self, src, src_length,feature=None):
         src = self.embedding(src)
+        if feature is not None:
+            src = torch.cat([ feature,src], dim=1)
+            src_length = src_length + feature.size(1)
+        src = torch.cat([self.cls.expand(src.size(0), -1, -1), src], dim=1)
         src = src + self.pe(src)
-        src = torch.cat([self.cls.repeat(src.size(0), 1, 1), src], dim=1)
         mask = self.create_padding_mask(src, src_length + 1).to(src.device)
         output = self.transformer_encoder(src, src_key_padding_mask=mask)
         return output[:, 0]
@@ -278,14 +281,14 @@ class VQAModel(nn.Module):
                  dim_feedforward: int, dropout: float):
         super().__init__()
         # self.resnet = resnet18(weights='DEFAULT')
-        self.conv2d = nn.Conv2d(3, 768, kernel_size=(16,16), stride=(16,16))
+        self.conv2d = nn.Conv2d(3, num_features, kernel_size=(16,16), stride=(16,16))
         self.text_encoder = TransformerEncoder(vocab_size, num_features, nhead, num_encoder_layers, dim_feedforward,
                                                dropout)
 
         self.fc = nn.Sequential(
-            nn.Linear(512 * 2, 1024),
+            nn.Linear(num_features , num_features*2),
             nn.ReLU(inplace=True),
-            nn.Linear(1024, n_answer)
+            nn.Linear(num_features*2, n_answer)
         )
 
     def forward(self, image, question, question_length):
@@ -296,7 +299,7 @@ class VQAModel(nn.Module):
         feature = self.text_encoder(question, question_length,image_feature)  # テキストの特徴量
 
         #x = torch.cat([image_feature, question_feature], dim=1)
-        x = self.fc(x)
+        x = self.fc(feature)
 
         return x
 
@@ -393,13 +396,13 @@ def main():
                                               drop_last=False, collate_fn=train_dataset.collate_fn)
 
     model = VQAModel(vocab_size=len(train_dataset.question2idx) + 1, n_answer=len(train_dataset.answer2idx),
-                     num_features=512, nhead=8, num_encoder_layers=3, dim_feedforward=1024, dropout=0.5).float().to(
+                     num_features=768, nhead=8, num_encoder_layers=3, dim_feedforward=1024, dropout=0.5).float().to(
         device)
 
     # optimizer / criterion
-    num_epoch = 20
+    num_epoch = 100
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=1e-4)
 
     # train model
     print("start training...")
