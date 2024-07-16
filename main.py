@@ -16,6 +16,7 @@ from tqdm import tqdm
 from torchvision.models import resnet18, resnet50, vit_b_16
 from transformers import BertTokenizer
 import math
+import torch.nn.functional as F
 
 
 def set_seed(seed):
@@ -88,6 +89,7 @@ class VQADataset(torch.utils.data.Dataset):
             for word in words:
                 if word not in self.question2idx:
                     self.question2idx[word] = len(self.question2idx)
+        self.question2idx["[UNK]"] = len(self.question2idx)
         self.idx2question = {v: k for k, v in self.question2idx.items()}  # 逆変換用の辞書(question)
         if self.answer:
             # 回答に含まれる単語を辞書に追加
@@ -97,6 +99,7 @@ class VQADataset(torch.utils.data.Dataset):
                     words = process_text(words)
                     if words not in self.answer2idx:
                         self.answer2idx[words] = len(self.answer2idx)
+            self.answer2idx["[UNK]"] = len(self.answer2idx)
             self.idx2answer = {v: k for k, v in self.answer2idx.items()}  # 逆変換用の辞書(answer)
 
     def max_len(self):
@@ -150,14 +153,23 @@ class VQADataset(torch.utils.data.Dataset):
         question_words = self.tokenizer.tokenize(question_words)
         question = []
         for word in question_words:
-            question.append(self.question2idx[word])
+            try:
+                question.append(self.question2idx[word])
+            except KeyError:
+                question.append(self.question2idx["[UNK]"])
         question_length = len(question)
 
         if self.answer:
             answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
+            confidences = [answer["answer_confidence"] for answer in self.df["answers"][idx]]
+            # confidenceがyesなら2,maybeなら1,noなら0に変換
+            confidences = [2 if confidence == "yes" else 1 if confidence == "maybe" else 0 for confidence in
+                           confidences]
+            confidences=mode(confidences)
+            # confidenceが
             mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
 
-            return image, torch.Tensor(question), torch.Tensor(answers), mode_answer_idx, question_length
+            return image, torch.Tensor(question), torch.Tensor(answers), confidences, mode_answer_idx, question_length
 
         else:
             return image, torch.Tensor(question), question_length
@@ -176,14 +188,16 @@ class VQADataset(torch.utils.data.Dataset):
         answers = []
         mode_answer_idxs = []
         question_lengths = []
-        if len(batch[0]) == 5:
-            for image, question, answer, mode_answer_idx, question_length in batch:
+        confidences = []
+        if len(batch[0]) == 6:
+            for image, question, answer, confidence, mode_answer_idx, question_length in batch:
                 images.append(image)
                 questions.append(question)
                 answers.append(answer)
                 mode_answer_idxs.append(mode_answer_idx)
                 question_lengths.append(question_length)
-
+                confidences.append(confidence)
+            confidences = torch.Tensor(confidences).long()
             mode_answer_idxs = torch.Tensor(mode_answer_idxs).int()
             question_lengths = torch.Tensor(question_lengths).int()
             images = torch.stack(images, dim=0)
@@ -192,7 +206,7 @@ class VQADataset(torch.utils.data.Dataset):
             for i, question in enumerate(questions):
                 questions_batch[i, :len(question)] = question
 
-            return images, questions_batch, answers, mode_answer_idxs, question_lengths
+            return images, questions_batch, answers, confidences, mode_answer_idxs, question_lengths
         else:
             for image, question, question_length in batch:
                 images.append(image)
@@ -205,7 +219,7 @@ class VQADataset(torch.utils.data.Dataset):
             for i, question in enumerate(questions):
                 questions_batch[i, :len(question)] = question
 
-            return images, questions, question_lengths
+            return images, questions_batch, question_lengths
 
 
 # 2. 評価指標の実装
@@ -260,10 +274,10 @@ class TransformerEncoder(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(layers, num_encoder_layers)
         self.cls = nn.Parameter(torch.randn(1, 1, d_model))
 
-    def forward(self, src, src_length,feature=None):
+    def forward(self, src, src_length, feature=None):
         src = self.embedding(src)
         if feature is not None:
-            src = torch.cat([ feature,src], dim=1)
+            src = torch.cat([feature, src], dim=1)
             src_length = src_length + feature.size(1)
         src = torch.cat([self.cls.expand(src.size(0), -1, -1), src], dim=1)
         src = src + self.pe(src)
@@ -281,31 +295,41 @@ class VQAModel(nn.Module):
                  dim_feedforward: int, dropout: float):
         super().__init__()
         # self.resnet = resnet18(weights='DEFAULT')
-        self.conv2d = nn.Conv2d(3, num_features, kernel_size=(16,16), stride=(16,16))
+        self.vit = vit_b_16()
+        self.vit.heads = nn.Identity()
         self.text_encoder = TransformerEncoder(vocab_size, num_features, nhead, num_encoder_layers, dim_feedforward,
                                                dropout)
 
         self.fc = nn.Sequential(
-            nn.Linear(num_features , num_features*2),
+            nn.Linear(num_features*2, num_features * 4),
             nn.ReLU(inplace=True),
-            nn.Linear(num_features*2, n_answer)
+            nn.Linear(num_features * 4, n_answer)
         )
+        self.fc_type = nn.Sequential(
+            nn.Linear(num_features*2, num_features * 4),
+            nn.ReLU(inplace=True),
+            nn.Linear(num_features * 4, 3))
 
-    def forward(self, image, question, question_length):
-        image_feature = self.conv2d(image)  # 画像の特徴量
-        batch_size ,vector_size, h, w = image_feature.size()
-        # question=torch.cat([image_feature,question],dim=1)
-        image_feature = image_feature.view(image_feature.size(0), h*w, vector_size)
-        feature = self.text_encoder(question, question_length,image_feature)  # テキストの特徴量
-
-        #x = torch.cat([image_feature, question_feature], dim=1)
-        x = self.fc(feature)
-
-        return x
+    def forward(self, image, question, question_length, is_clip=False):
+        image_feature = self.vit(image)  # 画像の特徴量
+        batch_size, vector_size = image_feature.size(0), image_feature.size(1)
+        text_feature = self.text_encoder(question, question_length)  # テキストの特徴量
+        # text_feature: [batch_size, vector_size]
+        if is_clip:
+            assert text_feature.size(1) == image_feature.size(1)
+            image_feature = F.normalize(image_feature, p=2, dim=1)
+            text_feature = F.normalize(text_feature, p=2, dim=1)
+            feature = torch.bmm(image_feature.unsqueeze(2), text_feature.unsqueeze(1)) * 100
+            return feature
+        else:
+            feature = torch.cat([image_feature, text_feature], dim=1)
+            x = self.fc(feature)
+            x_type = self.fc_type(feature)
+            return x, x_type
 
 
 # 4. 学習の実装
-def train(model, dataloader, optimizer, criterion, device, batch_size=64):
+def train(model, dataloader, optimizer, criterion, device, batch_size=64, is_clip=False):
     model.train()
 
     total_loss = 0
@@ -313,14 +337,25 @@ def train(model, dataloader, optimizer, criterion, device, batch_size=64):
     simple_acc = 0
     scaler = torch.cuda.amp.GradScaler(4096)
     start = time.time()
-    for i, (image, question, answers, mode_answer, question_length) in tqdm(enumerate(dataloader),
-                                                                            total=len(
-                                                                                dataloader.dataset) // batch_size):
+    for i, (image, question, answers, confidences, mode_answer, question_length) in tqdm(enumerate(dataloader),
+                                                                                         total=len(
+                                                                                             dataloader.dataset) // batch_size):
         image, question, answers, mode_answer = image.to(device), question.to(device), answers.to(
             device), mode_answer.long().to(device)
         with torch.cuda.amp.autocast():
-            pred = model(image, question, question_length)
-            loss = criterion(pred, mode_answer.squeeze())
+            pred = model(image, question, question_length, is_clip=is_clip)
+            if is_clip:
+                labels = torch.arange(0, pred.size(1)).to(device)
+                # pred: [batch_size, n,n]
+                batch_size, num_features, _ = pred.size()
+                loss1 = criterion(pred.reshape(pred.size(0) * pred.size(1), -1),
+                                  labels.unsqueeze(0).expand(batch_size, -1).contiguous().view(-1))
+                loss2 = criterion(pred.transpose(1, 2).reshape(pred.size(0) * pred.size(1), -1),
+                                  labels.unsqueeze(0).expand(batch_size, -1).contiguous().view(-1))
+                loss = (loss1 + loss2) / 2
+            else:
+                loss = criterion(pred[0], mode_answer.squeeze())
+                loss+=criterion(pred[1], confidences.squeeze().to(device))/2
 
         optimizer.zero_grad()
         scaler.scale(loss).backward()
@@ -332,8 +367,12 @@ def train(model, dataloader, optimizer, criterion, device, batch_size=64):
         scaler.update()
 
         total_loss += loss.item()
-        total_acc += VQA_criterion(pred.argmax(1), answers)  # VQA accuracy
-        simple_acc += (pred.argmax(1) == mode_answer).float().mean().item()  # simple accuracy
+        if not is_clip:
+            total_acc += VQA_criterion(pred[0].argmax(1), answers)  # VQA accuracy
+            simple_acc += (pred[0].argmax(1) == mode_answer).float().mean().item()  # simple accuracy
+        else:
+            total_acc += 0
+            simple_acc += 0
 
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
@@ -388,45 +427,53 @@ def main():
     print(f"answer vocab size: {len(train_dataset.answer2idx)}")
     print(f"question max length: {train_dataset.max_len()}")
 
-    batch_size = 64
+    batch_size = 32
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True,
-                                               num_workers=8, drop_last=True, collate_fn=train_dataset.collate_fn)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, pin_memory=True, num_workers=8,
-                                              drop_last=False, collate_fn=train_dataset.collate_fn)
 
-    model = VQAModel(vocab_size=len(train_dataset.question2idx) + 1, n_answer=len(train_dataset.answer2idx),
-                     num_features=768, nhead=8, num_encoder_layers=3, dim_feedforward=1024, dropout=0.5).float().to(
-        device)
 
     # optimizer / criterion
     num_epoch = 100
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=1e-4)
+    model = VQAModel(vocab_size=len(train_dataset.question2idx) + 1, n_answer=len(train_dataset.answer2idx),
+                     num_features=768, nhead=8, num_encoder_layers=12, dim_feedforward=1024,
+                     dropout=0.5).float().to(
+        device)
+    is_clips=[True,False]
+    for is_clip in is_clips:
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True,
+                                                   num_workers=8, drop_last=True, collate_fn=train_dataset.collate_fn)
 
-    # train model
-    print("start training...")
-    for epoch in range(num_epoch):
-        train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device,
-                                                                    batch_size)
-        print(f"【{epoch + 1}/{num_epoch}】\n"
-              f"train time: {train_time:.2f} [s]\n"
-              f"train loss: {train_loss:.4f}\n"
-              f"train acc: {train_acc:.4f}\n"
-              f"train simple acc: {train_simple_acc:.4f}")
 
-        torch.save({
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "epoch": epoch
-        }, f"./checkpoint/checkpoint.cpt")
+
+        criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
+
+        # train model
+        print("start pretraining...")
+        for epoch in range(num_epoch):
+            train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device,
+                                                                        batch_size,is_clip=is_clip)
+            print(f"【{epoch + 1}/{num_epoch}】\n"
+                  f"train time: {train_time:.2f} [s]\n"
+                  f"train loss: {train_loss:.4f}\n"
+                  f"train acc: {train_acc:.4f}\n"
+                  f"train simple acc: {train_simple_acc:.4f}")
+
+            torch.save({
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "epoch": epoch,
+                "is_clip":is_clip
+            }, f"./checkpoint/checkpoint.cpt")
     # 提出用ファイルの作成
     model.eval()
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, pin_memory=True,
+                                              num_workers=8,
+                                              drop_last=False, collate_fn=train_dataset.collate_fn)
     submission = []
-    for image, question in test_loader:
+    for image, question, question_length in test_loader:
         image, question = image.to(device), question.to(device)
-        pred = model(image, question)
-        pred = pred.argmax(1).cpu().item()
+        pred = model(image, question, question_length)
+        pred = pred[0].argmax(1).cpu().item()
         submission.append(pred)
 
     submission = [train_dataset.idx2answer[id] for id in submission]
