@@ -165,7 +165,7 @@ class VQADataset(torch.utils.data.Dataset):
             # confidenceがyesなら2,maybeなら1,noなら0に変換
             confidences = [2 if confidence == "yes" else 1 if confidence == "maybe" else 0 for confidence in
                            confidences]
-            confidences=mode(confidences)
+            confidences = mode(confidences)
             # confidenceが
             mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
 
@@ -295,41 +295,36 @@ class VQAModel(nn.Module):
                  dim_feedforward: int, dropout: float):
         super().__init__()
         # self.resnet = resnet18(weights='DEFAULT')
-        self.vit = vit_b_16()
-        self.vit.heads = nn.Identity()
+        self.image_encoder=resnet18(weights='DEFAULT')
+        self.image_encoder.fc = nn.Identity()
         self.text_encoder = TransformerEncoder(vocab_size, num_features, nhead, num_encoder_layers, dim_feedforward,
                                                dropout)
 
         self.fc = nn.Sequential(
-            nn.Linear(num_features*2, num_features * 4),
+            nn.Linear(num_features * 2, num_features * 4),
             nn.ReLU(inplace=True),
             nn.Linear(num_features * 4, n_answer)
         )
         self.fc_type = nn.Sequential(
-            nn.Linear(num_features*2, num_features * 4),
+            nn.Linear(num_features * 2, num_features * 4),
             nn.ReLU(inplace=True),
             nn.Linear(num_features * 4, 3))
 
-    def forward(self, image, question, question_length, is_clip=False):
-        image_feature = self.vit(image)  # 画像の特徴量
+    def forward(self, image, question, question_length):
+        image_feature = self.image_encoder(image)  # 画像の特徴量
         batch_size, vector_size = image_feature.size(0), image_feature.size(1)
         text_feature = self.text_encoder(question, question_length)  # テキストの特徴量
         # text_feature: [batch_size, vector_size]
-        if is_clip:
-            assert text_feature.size(1) == image_feature.size(1)
-            image_feature = F.normalize(image_feature, p=2, dim=1)
-            text_feature = F.normalize(text_feature, p=2, dim=1)
-            feature = torch.bmm(image_feature.unsqueeze(2), text_feature.unsqueeze(1)) * 100
-            return feature
-        else:
-            feature = torch.cat([image_feature, text_feature], dim=1)
-            x = self.fc(feature)
-            x_type = self.fc_type(feature)
-            return x, x_type
+        feature = torch.cat([image_feature, text_feature], dim=1)
+        x = self.fc(feature)
+        x_type = self.fc_type(feature)
+        return x, x_type
+
+
 
 
 # 4. 学習の実装
-def train(model, dataloader, optimizer, criterion, device, batch_size=64, is_clip=False):
+def train(model, dataloader, optimizer, criterion, device, batch_size=64):
     model.train()
 
     total_loss = 0
@@ -343,19 +338,9 @@ def train(model, dataloader, optimizer, criterion, device, batch_size=64, is_cli
         image, question, answers, mode_answer = image.to(device), question.to(device), answers.to(
             device), mode_answer.long().to(device)
         with torch.cuda.amp.autocast():
-            pred = model(image, question, question_length, is_clip=is_clip)
-            if is_clip:
-                labels = torch.arange(0, pred.size(1)).to(device)
-                # pred: [batch_size, n,n]
-                batch_size, num_features, _ = pred.size()
-                loss1 = criterion(pred.reshape(pred.size(0) * pred.size(1), -1),
-                                  labels.unsqueeze(0).expand(batch_size, -1).contiguous().view(-1))
-                loss2 = criterion(pred.transpose(1, 2).reshape(pred.size(0) * pred.size(1), -1),
-                                  labels.unsqueeze(0).expand(batch_size, -1).contiguous().view(-1))
-                loss = (loss1 + loss2) / 2
-            else:
-                loss = criterion(pred[0], mode_answer.squeeze())
-                loss+=criterion(pred[1], confidences.squeeze().to(device))/2
+            pred = model(image, question, question_length)
+            loss = criterion(pred[0], mode_answer.squeeze())
+            loss += criterion(pred[1], confidences.squeeze().to(device)) / 2
 
         optimizer.zero_grad()
         scaler.scale(loss).backward()
@@ -367,12 +352,8 @@ def train(model, dataloader, optimizer, criterion, device, batch_size=64, is_cli
         scaler.update()
 
         total_loss += loss.item()
-        if not is_clip:
-            total_acc += VQA_criterion(pred[0].argmax(1), answers)  # VQA accuracy
-            simple_acc += (pred[0].argmax(1) == mode_answer).float().mean().item()  # simple accuracy
-        else:
-            total_acc += 0
-            simple_acc += 0
+        total_acc += VQA_criterion(pred[0].argmax(1), answers)  # VQA accuracy
+        simple_acc += (pred[0].argmax(1) == mode_answer).float().mean().item()  # simple accuracy
 
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
@@ -427,43 +408,40 @@ def main():
     print(f"answer vocab size: {len(train_dataset.answer2idx)}")
     print(f"question max length: {train_dataset.max_len()}")
 
-    batch_size = 32
-
-
+    batch_size = 64
 
     # optimizer / criterion
     num_epoch = 100
-    model = VQAModel(vocab_size=len(train_dataset.question2idx) + 1, n_answer=len(train_dataset.answer2idx),
-                     num_features=768, nhead=8, num_encoder_layers=12, dim_feedforward=1024,
-                     dropout=0.5).float().to(
-        device)
-    is_clips=[True,False]
-    for is_clip in is_clips:
-        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True,
-                                                   num_workers=8, drop_last=True, collate_fn=train_dataset.collate_fn)
+    vqa_model = VQAModel(vocab_size=len(train_dataset.question2idx) + 1, n_answer=len(train_dataset.answer2idx),
+                     num_features=512, nhead=8, num_encoder_layers=6, dim_feedforward=1024,
+                     dropout=0.5).float()
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True,
+                                               num_workers=8, drop_last=True, collate_fn=train_dataset.collate_fn)
+
+    criterion = nn.CrossEntropyLoss()
 
 
+    model = vqa_model.to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
+    scheduler=torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,T_max=num_epoch,eta_min=1e-5)
+    # train model
+    print("start pretraining...")
+    for epoch in range(num_epoch):
+        train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion,
+                                                                    device,
+                                                                    batch_size)
+        print(f"【{epoch + 1}/{num_epoch}】\n"
+              f"train time: {train_time:.2f} [s]\n"
+              f"train loss: {train_loss:.4f}\n"
+              f"train acc: {train_acc:.4f}\n"
+              f"train simple acc: {train_simple_acc:.4f}")
 
-        criterion = nn.CrossEntropyLoss()
-        optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
-
-        # train model
-        print("start pretraining...")
-        for epoch in range(num_epoch):
-            train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device,
-                                                                        batch_size,is_clip=is_clip)
-            print(f"【{epoch + 1}/{num_epoch}】\n"
-                  f"train time: {train_time:.2f} [s]\n"
-                  f"train loss: {train_loss:.4f}\n"
-                  f"train acc: {train_acc:.4f}\n"
-                  f"train simple acc: {train_simple_acc:.4f}")
-
-            torch.save({
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "epoch": epoch,
-                "is_clip":is_clip
-            }, f"./checkpoint/checkpoint.cpt")
+        torch.save({
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "epoch": epoch,
+        }, f"./checkpoint/checkpoint.cpt")
+        scheduler.step()
     # 提出用ファイルの作成
     model.eval()
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, pin_memory=True,
