@@ -14,9 +14,11 @@ from tqdm import tqdm
 
 # 学習済みモデル
 from torchvision.models import resnet18, resnet50, vit_b_16
-from transformers import BertTokenizer
+from transformers import BertTokenizer,BertModel
 import math
 import torch.nn.functional as F
+
+from clip_model import CLIPModel
 
 
 def set_seed(seed):
@@ -81,6 +83,7 @@ class VQADataset(torch.utils.data.Dataset):
         self.answer2idx = {}
         self.idx2question = {}
         self.idx2answer = {}
+        #bertのtokenizerを取得
         self.tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
         # 質問文に含まれる単語を辞書に追加
         for question in self.df["question"]:
@@ -146,18 +149,12 @@ class VQADataset(torch.utils.data.Dataset):
             10人の回答者の回答のid
         mode_answer_idx : torch.Tensor  (1)
             10人の回答者の回答の中で最頻値の回答のid
+        confidences : torch.Tensor  (1)
+            10人の回答者の回答の中で最頻値の回答のconfidence
         """
         image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
         image = self.transform(image)
-        question_words = process_text(self.df["question"][idx])
-        question_words = self.tokenizer.tokenize(question_words)
-        question = []
-        for word in question_words:
-            try:
-                question.append(self.question2idx[word])
-            except KeyError:
-                question.append(self.question2idx["[UNK]"])
-        question_length = len(question)
+        question = process_text(self.df["question"][idx])
 
         if self.answer:
             answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
@@ -169,10 +166,10 @@ class VQADataset(torch.utils.data.Dataset):
             # confidenceが
             mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
 
-            return image, torch.Tensor(question), torch.Tensor(answers), confidences, mode_answer_idx, question_length
+            return image, question, torch.Tensor(answers), confidences, mode_answer_idx
 
         else:
-            return image, torch.Tensor(question), question_length
+            return image, question
 
     def __len__(self):
         return len(self.df)
@@ -187,39 +184,31 @@ class VQADataset(torch.utils.data.Dataset):
         questions = []
         answers = []
         mode_answer_idxs = []
-        question_lengths = []
         confidences = []
-        if len(batch[0]) == 6:
-            for image, question, answer, confidence, mode_answer_idx, question_length in batch:
+        tokenizer=BertTokenizer.from_pretrained("bert-base-uncased")
+        if len(batch[0]) == 5:
+            for image, question, answer, confidence, mode_answer_idx in batch:
                 images.append(image)
                 questions.append(question)
                 answers.append(answer)
                 mode_answer_idxs.append(mode_answer_idx)
-                question_lengths.append(question_length)
                 confidences.append(confidence)
             confidences = torch.Tensor(confidences).long()
             mode_answer_idxs = torch.Tensor(mode_answer_idxs).int()
-            question_lengths = torch.Tensor(question_lengths).int()
             images = torch.stack(images, dim=0)
             answers = torch.stack(answers, dim=0)
-            questions_batch = torch.zeros(len(questions), int(max(question_lengths)), dtype=torch.long)
-            for i, question in enumerate(questions):
-                questions_batch[i, :len(question)] = question
+            questions_batch = tokenizer(questions,padding=True)
 
-            return images, questions_batch, answers, confidences, mode_answer_idxs, question_lengths
+            return images, torch.tensor(questions_batch.data["input_ids"]), answers, confidences, mode_answer_idxs,torch.tensor(questions_batch.data["attention_mask"])
         else:
-            for image, question, question_length in batch:
+            for image, question in batch:
                 images.append(image)
                 questions.append(question)
-                question_lengths.append(question_length)
 
             images = torch.stack(images, dim=0)
-            question_lengths = torch.Tensor(question_lengths)
-            questions_batch = torch.zeros(len(questions), int(max(question_lengths)), dtype=torch.long)
-            for i, question in enumerate(questions):
-                questions_batch[i, :len(question)] = question
+            questions_batch = tokenizer(questions,padding=True)
 
-            return images, questions_batch, question_lengths
+            return images, torch.tensor(questions_batch.data["input_ids"]),torch.tensor(questions_batch.data["attention_mask"])
 
 
 # 2. 評価指標の実装
@@ -242,78 +231,40 @@ def VQA_criterion(batch_pred: torch.Tensor, batch_answers: torch.Tensor):
     return total_acc / len(batch_pred)
 
 
-class PositionalEncoding(nn.Module):
-
-    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(max_len, 1, d_model)
-        pe[:, 0, 0::2] = torch.sin(position * div_term)
-        pe[:, 0, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Tensor, shape [seq_len, batch_size, embedding_dim]
-        """
-        x = x + self.pe[:x.size(0)]
-        return self.dropout(x)
 
 
-class TransformerEncoder(nn.Module):
-    def __init__(self, vocab_size: int, d_model: int, nhead: int, num_encoder_layers: int, dim_feedforward: int,
-                 dropout: float):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=0)
-        self.pe = PositionalEncoding(d_model, dropout=dropout)
-        layers = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(layers, num_encoder_layers)
-        self.cls = nn.Parameter(torch.randn(1, 1, d_model))
-
-    def forward(self, src, src_length, feature=None):
-        src = self.embedding(src)
-        if feature is not None:
-            src = torch.cat([feature, src], dim=1)
-            src_length = src_length + feature.size(1)
-        src = torch.cat([self.cls.expand(src.size(0), -1, -1), src], dim=1)
-        src = src + self.pe(src)
-        mask = self.create_padding_mask(src, src_length + 1).to(src.device)
-        output = self.transformer_encoder(src, src_key_padding_mask=mask)
-        return output[:, 0]
-
-    def create_padding_mask(self, src, src_length):
-        mask = (torch.arange(src.size(1)))[None, :] >= src_length[:, None]
-        return mask
-
-
+# 3. モデルの実装
 class VQAModel(nn.Module):
-    def __init__(self, vocab_size: int, n_answer: int, num_features: int, nhead: int, num_encoder_layers: int,
-                 dim_feedforward: int, dropout: float):
+    def __init__(self,  n_answer: int, image_features: int,text_feature: int,dropout: float = 0.5):
         super().__init__()
         # self.resnet = resnet18(weights='DEFAULT')
         self.image_encoder=resnet18(weights='DEFAULT')
         self.image_encoder.fc = nn.Identity()
-        self.text_encoder = TransformerEncoder(vocab_size, num_features, nhead, num_encoder_layers, dim_feedforward,
-                                               dropout)
-
+        self.image_fc=nn.Linear(512,image_features)
+        for param in self.image_encoder.parameters():
+            param.requires_grad = False
+        self.text_encoder = BertModel.from_pretrained("bert-base-uncased")
+        self.text_encoder.eval()
+        self.text_fc=nn.Linear(768,text_feature)
+        num_features=image_features+text_feature
         self.fc = nn.Sequential(
-            nn.Linear(num_features * 2, num_features * 4),
+            nn.Dropout(dropout),
+            nn.Linear(num_features, num_features * 2),
             nn.ReLU(inplace=True),
-            nn.Linear(num_features * 4, n_answer)
+            nn.Linear(num_features * 2, n_answer)
         )
         self.fc_type = nn.Sequential(
-            nn.Linear(num_features * 2, num_features * 4),
+            nn.Dropout(dropout),
+            nn.Linear(num_features , num_features * 2),
             nn.ReLU(inplace=True),
-            nn.Linear(num_features * 4, 3))
+            nn.Linear(num_features * 2, 3))
 
-    def forward(self, image, question, question_length):
+    def forward(self, image, question, attn_mask):
         image_feature = self.image_encoder(image)  # 画像の特徴量
-        batch_size, vector_size = image_feature.size(0), image_feature.size(1)
-        text_feature = self.text_encoder(question, question_length)  # テキストの特徴量
+        image_feature = self.image_fc(image_feature)
+        with torch.no_grad():
+            text_feature = self.text_encoder(question,attention_mask=attn_mask.to(question.device)).last_hidden_state[:,0]
+        text_feature = self.text_fc(text_feature)
         # text_feature: [batch_size, vector_size]
         feature = torch.cat([image_feature, text_feature], dim=1)
         x = self.fc(feature)
@@ -324,6 +275,8 @@ class VQAModel(nn.Module):
 
 
 # 4. 学習の実装
+
+
 def train(model, dataloader, optimizer, criterion, device, batch_size=64):
     model.train()
 
@@ -332,13 +285,13 @@ def train(model, dataloader, optimizer, criterion, device, batch_size=64):
     simple_acc = 0
     scaler = torch.cuda.amp.GradScaler(4096)
     start = time.time()
-    for i, (image, question, answers, confidences, mode_answer, question_length) in tqdm(enumerate(dataloader),
+    for i, (image, question, answers, confidences, mode_answer, attn_mask) in tqdm(enumerate(dataloader),
                                                                                          total=len(
                                                                                              dataloader.dataset) // batch_size):
         image, question, answers, mode_answer = image.to(device), question.to(device), answers.to(
             device), mode_answer.long().to(device)
         with torch.cuda.amp.autocast():
-            pred = model(image, question, question_length)
+            pred = model(image, question, attn_mask)
             loss = criterion(pred[0], mode_answer.squeeze())
             loss += criterion(pred[1], confidences.squeeze().to(device)) / 2
 
@@ -411,21 +364,21 @@ def main():
     batch_size = 64
 
     # optimizer / criterion
-    num_epoch = 100
-    vqa_model = VQAModel(vocab_size=len(train_dataset.question2idx) + 1, n_answer=len(train_dataset.answer2idx),
-                     num_features=512, nhead=8, num_encoder_layers=6, dim_feedforward=1024,
-                     dropout=0.5).float()
+    num_epoch =20
+
+    # train model
+
+    print("start pretraining...")
+    vqa_model = VQAModel(n_answer=len(train_dataset.answer2idx), image_features=512, text_feature=512,
+                         dropout=0.5).float()
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True,
                                                num_workers=8, drop_last=True, collate_fn=train_dataset.collate_fn)
 
     criterion = nn.CrossEntropyLoss()
 
-
     model = vqa_model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
-    scheduler=torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,T_max=num_epoch,eta_min=1e-5)
-    # train model
-    print("start pretraining...")
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epoch, eta_min=1e-5)
     for epoch in range(num_epoch):
         train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion,
                                                                     device,
@@ -448,9 +401,9 @@ def main():
                                               num_workers=8,
                                               drop_last=False, collate_fn=train_dataset.collate_fn)
     submission = []
-    for image, question, question_length in test_loader:
+    for image, question, attn_mask in test_loader:
         image, question = image.to(device), question.to(device)
-        pred = model(image, question, question_length)
+        pred = model(image, question, attn_mask)
         pred = pred[0].argmax(1).cpu().item()
         submission.append(pred)
 
